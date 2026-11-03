@@ -1,0 +1,157 @@
+diff --git a/RealtekRTL8111/RealtekRTL8111.cpp b/RealtekRTL8111/RealtekRTL8111.cpp
+index 164d40e..6f662e0 100644
+--- a/RealtekRTL8111/RealtekRTL8111.cpp
++++ b/RealtekRTL8111/RealtekRTL8111.cpp
+@@ -92,6 +92,7 @@ bool RTL8111::init(OSDictionary *properties)
+         lastIntrTime = 0;
+         wolCapable = false;
+         wolActive = false;
++        wolArmedOnDisable = false;
+         enableTSO4 = false;
+         enableTSO6 = false;
+         enableCSO6 = false;
+@@ -344,10 +345,62 @@ void RTL8111::systemWillShutdown(IOOptionBits specifier)
+     DebugLog("systemWillShutdown() ===>\n");
+     
+     if ((kIOMessageSystemWillPowerOff | kIOMessageSystemWillRestart) & specifier) {
++        /*
++         * WoL from S5: macOS arms WoL only for sleep, so arm magic packet wakeup here,
++         * for a power off and for a restart. After a restart the next boot finds the
++         * magic packet bit (ERI 0xDE bit 0) set and WoL stays enabled.
++         */
++        bool armWoL = wolCapable && ((specifier == kIOMessageSystemWillPowerOff) ||
++                                     (specifier == kIOMessageSystemWillRestart));
++
++        if (armWoL) {
++            wolActive = true;
++            linuxData.wol_enabled = WOL_ENABLED;
++            linuxData.wol_opts |= WAKE_MAGIC;
++        }
+         disable(netif);
+         
++        /*
++         * The kernel takes all interfaces down (if_down_all()) before this is called, with
++         * the WoL setting of the moment. After a wake macOS has called
++         * setWakeOnMagicPacket(false), so rtl8168_powerdown_pll() powered the PHY and
++         * the PLL down, and disable() did nothing here. Power them up again and power
++         * down with WoL, as disable() does. Not when the interface went down with WoL:
++         * a second power-down would renegotiate before the link partner's abilities
++         * are known, and the link would come up at 100 Mbit/s instead of 10.
++         */
++        if (armWoL && !wolArmedOnDisable) {
++            rtl8168_powerup_pll(&linuxData);
++            
++            switch (linuxData.mcfg) {
++                case CFG_METHOD_14 ... CFG_METHOD_15:
++                    WriteReg8(0xD0, ReadReg8(0xD0) | BIT_6);
++                    break;
++                    
++                case CFG_METHOD_16 ... CFG_METHOD_32:
++                    WriteReg8(0xD0, ReadReg8(0xD0) | BIT_6);
++                    WriteReg8(0xF2, ReadReg8(0xF2) | BIT_6);
++                    break;
++                    
++                default:
++                    break;
++            }
++            rtl8168_powerdown_pll(&linuxData);
++        }
++        
+         /* Restore the original MAC address. */
+         rtl8168_rar_set(&linuxData, (UInt8 *)&origMacAddr.bytes);
++        
++        if (armWoL) {
++            /* Clear a stale PME_Status (write 1 to clear), the BIOS sets PME_En. */
++            if (pciDevice && pciPMCtrlOffset) {
++                UInt16 val16 = pciDevice->extendedConfigRead16(pciPMCtrlOffset);
++                
++                if (val16 & kPCIPMCSPMEStatus)
++                    pciDevice->extendedConfigWrite16(pciPMCtrlOffset, val16);
++            }
++            IOLog("Ethernet [RealtekRTL8111]: WoL from S5 armed.\n");
++        }
+     }
+     
+     DebugLog("systemWillShutdown() <===\n");
+diff --git a/RealtekRTL8111/RealtekRTL8111.hpp b/RealtekRTL8111/RealtekRTL8111.hpp
+index 3f0d1da..be686d1 100644
+--- a/RealtekRTL8111/RealtekRTL8111.hpp
++++ b/RealtekRTL8111/RealtekRTL8111.hpp
+@@ -494,6 +494,7 @@ private:
+     bool needsUpdate;
+     bool wolCapable;
+     bool wolActive;
++    bool wolArmedOnDisable;
+     bool revisionC;
+     bool enableTSO4;
+     bool enableTSO6;
+diff --git a/RealtekRTL8111/RealtekRTL8111Hardware.cpp b/RealtekRTL8111/RealtekRTL8111Hardware.cpp
+index 9fa86dc..2dcb381 100644
+--- a/RealtekRTL8111/RealtekRTL8111Hardware.cpp
++++ b/RealtekRTL8111/RealtekRTL8111Hardware.cpp
+@@ -94,6 +94,12 @@ IOReturn RTL8111::setPowerStateWakeAction(OSObject *owner, void *arg1, void *arg
+         val16 &= ~(kPCIPMCSPowerStateMask | kPCIPMCSPMEStatus | kPCIPMCSPMEEnable);
+         val16 |= kPCIPMCSPowerStateD0;
+         
++        /*
++         * PME_Status is write-1-to-clear: writing 0 left it set after a WoL wake,
++         * and with a stale PME_Status the NIC never woke the machine from S5 again.
++         */
++        val16 |= kPCIPMCSPMEStatus;
++        
+         dev->extendedConfigWrite16(offset, val16);
+     }
+     return kIOReturnSuccess;
+@@ -133,7 +139,7 @@ bool RTL8111::initRTL8111()
+ {
+     struct rtl8168_private *tp = &linuxData;
+     OSNumber *chipsetNumber;
+-    UInt32 i, csi_tmp;
++    UInt32 i;
+     UInt16 macAddr[4];
+     UInt8 options1, options2;
+     bool result = false;
+@@ -571,7 +577,6 @@ bool RTL8111::initRTL8111()
+     
+     options1 = ReadReg8(Config3);
+     options2 = ReadReg8(Config5);
+-    csi_tmp = rtl8168_eri_read(baseAddr, 0xDE, 4, ERIAR_ExGMAC);
+     
+     switch (tp->mcfg) {
+         case CFG_METHOD_16:
+@@ -590,7 +595,13 @@ bool RTL8111::initRTL8111()
+         case CFG_METHOD_30:
+         case CFG_METHOD_31:
+         case CFG_METHOD_32:
+-            wol = ((options1 & LinkUp) || (csi_tmp & BIT_0) || (options2 & UWF) || (options2 & BWF) || (options2 & MWF)) ? true : false;
++            /*
++             * WoL from S5: ERI 0xDE bit 0 (magic packet wakeup) only tells whether WoL was
++             * armed when the chip was last powered down. After a shutdown or restart without
++             * WoL it is clear, and WoL was off for the whole session. These chips support
++             * magic packet wakeup anyway.
++             */
++            wol = true;
+             break;
+             
+         case CFG_METHOD_DEFAULT:
+@@ -604,6 +615,10 @@ bool RTL8111::initRTL8111()
+     /* Set wake on LAN support. */
+     wolCapable = wolCapable && wol;
+     
++    /* WoL from S5: the magic packet bit may be clear (see above), wake on it anyway. */
++    if (wolCapable)
++        tp->wol_opts |= WAKE_MAGIC;
++    
+ #ifdef DEBUG
+     
+     if (wolCapable)
+@@ -651,6 +666,9 @@ void RTL8111::disableRTL8111()
+     rtl8168_nic_reset(tp);
+     sleepRxEnable();
+     hardwareD3Para();
++
++    /* The PHY and the PLL stay powered only with WoL, see systemWillShutdown(). */
++    wolArmedOnDisable = (tp->wol_enabled == WOL_ENABLED);
+     rtl8168_powerdown_pll(tp);
+     
+     if (linkUp) {

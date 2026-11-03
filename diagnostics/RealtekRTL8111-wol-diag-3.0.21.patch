@@ -1,0 +1,984 @@
+diff --git a/RealtekRTL8111.xcodeproj/project.pbxproj b/RealtekRTL8111.xcodeproj/project.pbxproj
+index c7de3cc..3ee4367 100644
+--- a/RealtekRTL8111.xcodeproj/project.pbxproj
++++ b/RealtekRTL8111.xcodeproj/project.pbxproj
+@@ -3681,7 +3681,7 @@
+ 				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = NO;
+ 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+ 				CODE_SIGN_STYLE = Manual;
+-				CURRENT_PROJECT_VERSION = 3.0.4;
++				CURRENT_PROJECT_VERSION = 3.0.21;
+ 				DEBUG_INFORMATION_FORMAT = dwarf;
+ 				DEVELOPMENT_TEAM = FZX87E5QBD;
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = "";
+@@ -3730,7 +3730,7 @@
+ 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+ 				CODE_SIGN_STYLE = Manual;
+ 				COPY_PHASE_STRIP = NO;
+-				CURRENT_PROJECT_VERSION = 3.0.4;
++				CURRENT_PROJECT_VERSION = 3.0.21;
+ 				DEVELOPMENT_TEAM = FZX87E5QBD;
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = "";
+ 				ENABLE_NS_ASSERTIONS = NO;
+diff --git a/RealtekRTL8111/RealtekRTL8111.cpp b/RealtekRTL8111/RealtekRTL8111.cpp
+index 164d40e..c16b238 100644
+--- a/RealtekRTL8111/RealtekRTL8111.cpp
++++ b/RealtekRTL8111/RealtekRTL8111.cpp
+@@ -20,6 +20,10 @@
+ 
+ 
+ #include "RealtekRTL8111.hpp"
++#include <architecture/i386/pio.h>
++#include <sys/kauth.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOKitKeys.h>
+ 
+ #pragma mark --- function prototypes ---
+ 
+@@ -69,7 +73,14 @@ bool RTL8111::init(OSDictionary *properties)
+         promiscusMode = false;
+         multicastMode = false;
+         linkUp = false;
+-        
++        s5Cmds[0] = 0;
++        wolArmRestart = false;
++        sleepD0 = false;
++        shuttingDown = false;
++        wolTraceBuf[0] = 0;
++        rawBuf[0] = rawBuf[1] = NULL;
++        wompCalls = 0;
++
+         polling = false;
+         
+         mtu = ETH_DATA_LEN;
+@@ -142,9 +153,16 @@ void RTL8111::free()
+     RELEASE(baseMap);
+     baseAddr = NULL;
+     linuxData.mmio_addr = NULL;
+-    
++
+     RELEASE(pciDevice);
+ 
++    for (i = 0; i < 2; i++) {
++        if (rawBuf[i]) {
++            IOFree(rawBuf[i], kWoLDiagRawLen);
++            rawBuf[i] = NULL;
++        }
++    }
++
+     DebugLog("free() <===\n");
+     
+     super::free();
+@@ -326,10 +344,16 @@ IOReturn RTL8111::setPowerState(unsigned long powerStateOrdinal, IOService *poli
+     }
+     DebugLog("switching to power state %lu.\n", powerStateOrdinal);
+     
+-    if (powerStateOrdinal == kPowerStateOff)
++    if (powerStateOrdinal == kPowerStateOff) {
++        wolTrace("S");
++        wolDiag("sleep");
+         commandGate->runAction(setPowerStateSleepAction);
+-    else
++        wolDiag("sleep2");
++    } else {
++        wolTrace("W");
+         commandGate->runAction(setPowerStateWakeAction);
++        wolDiag("wake");
++    }
+ 
+     powerState = powerStateOrdinal;
+     
+@@ -344,12 +368,89 @@ void RTL8111::systemWillShutdown(IOOptionBits specifier)
+     DebugLog("systemWillShutdown() ===>\n");
+     
+     if ((kIOMessageSystemWillPowerOff | kIOMessageSystemWillRestart) & specifier) {
++        /*
++         * WoL from S5 (local patch, 2026-11-01): leave the NIC in the same state
++         * as after a cold boot, where WoL from S5 works: magic packet wakeup armed via
++         * wol_enabled (rtl8168_powerdown_pll() keeps the PHY up), D0, PME_En untouched,
++         * and a stale PME_Status from an earlier wake cleared (write 1 to clear).
++         */
++        bool armS5 = (kIOMessageSystemWillPowerOff & specifier) && wolCapable;
++        bool armRestart = wolArmRestart && (kIOMessageSystemWillRestart & specifier) && wolCapable;
++        bool wasEnabled = isEnabled;
++        char ev[16];
++
++        /* Local diagnostics: what happened before, saved to NVRAM (rtl-wol-trace). */
++        snprintf(ev, sizeof(ev), "X%c%d%d", (kIOMessageSystemWillPowerOff & specifier) ? 'P' : 'R', wasEnabled, linuxData.wol_enabled);
++        wolTrace(ev);
++        wolTraceSave();
++
++        /* Local diagnostics ("wolarm"): arm WoL for a restart too, as a power off does. */
++        if (armRestart) {
++            wolActive = true;
++            linuxData.wol_enabled = WOL_ENABLED;
++            linuxData.wol_opts |= WAKE_MAGIC;
++            IOLog("Ethernet [RealtekRTL8111]: WoL armed for restart (wolarm).\n");
++        }
++        if (armS5) {
++            wolDiag("shutdown");
++            wolActive = true;
++            linuxData.wol_enabled = WOL_ENABLED;
++            linuxData.wol_opts |= WAKE_MAGIC;
++        }
+         disable(netif);
+-        
++
++        /*
++         * Local patch: the network stack may have disabled the interface
++         * before this, with WoL off (after a wake macOS calls setWakeOnMagicPacket(false)).
++         * Then disable() did nothing here, and rtl8168_powerdown_pll() had powered the PHY and
++         * the PLL down (PMCH bit 7, 0xD0 bit 6, 0xF2 bit 6): no link and no WoL in S5, and after
++         * a restart the magic packet bit (ERI 0xDE bit 0) stays clear. Power them up again and
++         * arm the magic packet, as disable() does with WoL.
++         */
++        if ((armS5 || armRestart) && !wasEnabled) {
++            rtl8168_powerup_pll(&linuxData);
++            WriteReg8(0xD0, ReadReg8(0xD0) | BIT_6);
++            WriteReg8(0xF2, ReadReg8(0xF2) | BIT_6);
++            rtl8168_powerdown_pll(&linuxData);
++            IOLog("Ethernet [RealtekRTL8111]: WoL re-armed, the interface was already down.\n");
++            wolTrace("R");
++        }
++
+         /* Restore the original MAC address. */
+         rtl8168_rar_set(&linuxData, (UInt8 *)&origMacAddr.bytes);
++
++        if (armS5) {
++            if (pciDevice && pciPMCtrlOffset) {
++                UInt16 val16 = pciDevice->extendedConfigRead16(pciPMCtrlOffset);
++
++                if (val16 & kPCIPMCSPMEStatus)
++                    pciDevice->extendedConfigWrite16(pciPMCtrlOffset, val16);
++            }
++            IOLog("Ethernet [RealtekRTL8111]: WoL from S5 armed.\n");
++
++            /* Local diagnostics: S5 experiments queued with "s5run", only for this power off. */
++            if (s5Cmds[0]) {
++                char *cmd = s5Cmds;
++                char *next;
++
++                while (cmd && *cmd) {
++                    next = strchr(cmd, ';');
++
++                    if (next)
++                        *next++ = 0;
++
++                    IOLog("Ethernet [RealtekRTL8111]: s5run %s: 0x%x\n", cmd, wolDiagCmd(cmd));
++                    cmd = next;
++                }
++                s5Cmds[0] = 0;
++            }
++        }
++        snprintf(ev, sizeof(ev), "Y%02x", ReadReg8(PMCH));
++        wolTrace(ev);
++        wolTraceSave();
++        shuttingDown = true;
+     }
+-    
++
+     DebugLog("systemWillShutdown() <===\n");
+ 
+     /* Must call super shutdown or system will stall. */
+@@ -364,6 +465,8 @@ IOReturn RTL8111::enable(IONetworkInterface *netif)
+     
+     DebugLog("enable() ===>\n");
+ 
++    wolTrace(isEnabled ? "e" : "E");
++
+     if (isEnabled) {
+         DebugLog("Interface already enabled.\n");
+         result = kIOReturnSuccess;
+@@ -412,8 +515,20 @@ IOReturn RTL8111::disable(IONetworkInterface *netif)
+     
+     DebugLog("disable() ===>\n");
+     
+-    if (!isEnabled)
++    if (!isEnabled) {
++        wolTrace("d");
++
++        if (shuttingDown)
++            wolTraceSave();
++
+         goto done;
++    }
++    {
++        char ev[8];
++
++        snprintf(ev, sizeof(ev), "D%d", linuxData.wol_enabled);
++        wolTrace(ev);
++    }
+     
+     netif->stopOutputThread();
+     netif->flushOutputQueue();
+@@ -429,6 +544,13 @@ IOReturn RTL8111::disable(IONetworkInterface *netif)
+     interruptSource->disable();
+ 
+     disableRTL8111();
++    {
++        char ev[8];
++
++        /* P1: the PLL stays up in D3 (WoL), P0: powered down. */
++        snprintf(ev, sizeof(ev), "P%d", ReadReg8(PMCH) >> 7);
++        wolTrace(ev);
++    }
+     
+     clearDescriptors();
+     
+@@ -636,6 +758,7 @@ bool RTL8111::configureInterface(IONetworkInterface *interface)
+     }
+     snprintf(modelName, kNameLenght, "Realtek %s PCIe Gigabit Ethernet", rtl_chip_info[linuxData.chipset].name);
+     setProperty("model", modelName);
++    wolDiag("boot");
+     
+     DebugLog("configureInterface() <===\n");
+ 
+@@ -808,8 +931,14 @@ IOReturn RTL8111::setWakeOnMagicPacket(bool active)
+     DebugLog("setWakeOnMagicPacket() ===>\n");
+ 
+     if (wolCapable) {
++        char womp[48];
++
+         linuxData.wol_enabled = active ? WOL_ENABLED : WOL_DISABLED;
+         wolActive = active;
++        IOLog("Ethernet [RealtekRTL8111]: setWakeOnMagicPacket(%d)\n", active);
++        snprintf(womp, sizeof(womp), "calls=%u last=%d", ++wompCalls, active);
++        setProperty("WoLDiag-womp", womp);
++        wolTrace(active ? "M1" : "M0");
+         
+         DebugLog("WakeOnMagicPacket %s.\n", active ? "enabled" : "disabled");
+ 
+@@ -1802,3 +1931,604 @@ static inline u32 ether_crc(int length, unsigned char *data)
+     return crc;
+ }
+ 
++
++/* Local diagnostics for WoL: kernel log + ioreg property WoLDiag-<when>. */
++void RTL8111::wolDiag(const char *when)
++{
++    char buf[200];
++    char key[32];
++    UInt16 pm = (pciDevice && pciPMCtrlOffset) ? pciDevice->extendedConfigRead16(pciPMCtrlOffset) : 0;
++
++    snprintf(buf, sizeof(buf), "wolCapable=%d wolActive=%d wol_enabled=%d wol_opts=0x%x Config1=0x%02x Config3=0x%02x Config5=0x%02x PMCSR=0x%04x sleepD0=%d",
++             wolCapable, wolActive, linuxData.wol_enabled, linuxData.wol_opts,
++             ReadReg8(Config1), ReadReg8(Config3), ReadReg8(Config5), pm, sleepD0);
++    IOLog("Ethernet [RealtekRTL8111]: WoLDiag %s: %s\n", when, buf);
++    snprintf(key, sizeof(key), "WoLDiag-%s", when);
++    setProperty(key, buf);
++}
++
++/*
++ * Local diagnostics: a short trace of the WoL-relevant calls since boot (B boot, M setWakeOnMagicPacket,
++ * E/e enable, D/d disable (d: already down), P powerdown_pll branch, S/W sleep/wake, X systemWillShutdown
++ * (P power off / R restart, isEnabled, wol_enabled), R re-armed, Y PMCH at the end). Saved to NVRAM
++ * (rtl-wol-trace) at shutdown and restart, so it can be read after the next boot: nvram rtl-wol-trace
++ */
++void RTL8111::wolTrace(const char *ev)
++{
++    size_t n = strnlen(wolTraceBuf, sizeof(wolTraceBuf));
++
++    if (n + strlen(ev) + 2 <= sizeof(wolTraceBuf)) {
++        strlcat(wolTraceBuf, ev, sizeof(wolTraceBuf));
++        strlcat(wolTraceBuf, " ", sizeof(wolTraceBuf));
++    }
++    setProperty("WoLDiag-trace", wolTraceBuf);
++}
++
++void RTL8111::wolTraceSave()
++{
++    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
++
++    if (options) {
++        OSData *data = OSData::withBytes(wolTraceBuf, (unsigned int)strnlen(wolTraceBuf, sizeof(wolTraceBuf)));
++
++        if (data) {
++            options->setProperty("rtl-wol-trace", data);
++            data->release();
++        }
++        options->setProperty(kIONVRAMSyncNowPropertyKey, kIONVRAMSyncNowPropertyKey);
++        options->release();
++    }
++}
++
++/*
++ * Local diagnostics: on-demand reads, only when root asks
++ * with IORegistryEntrySetCFProperty(service, "WoLDiag", "<cmd>") (tool: ~/src/wolpeek).
++ * Nothing runs at boot, sleep or wake; at power off only what was queued with s5run.
++ *   phys <addr> <len>           physical RAM (ACPI tables, SMBIOS) -> WoLDiag-out
++ *   mmio <addr> <len>           uncached 32-bit reads (AMD FCH AcpiMmio, PCIe ECAM) -> WoLDiag-out
++ *   mmio8 <addr> <len>          uncached byte reads (FCH BiosRAM) -> WoLDiag-out
++ *   io8|io16|io32 <port> <len>  I/O port reads (ACPI PM1/GPE0 blocks) -> WoLDiag-out
++ *   nic                         NIC registers -> WoLDiag-nic
++ *   nicregs | eri | erihi       NIC MMIO 0x00-0xFF | ERI 0x000-0x1FF | ERI 0x200-0x3FF -> WoLDiag-out
++ *   nicocp | nicphy             MAC OCP registers the driver uses | PHY MII 0x00-0x0F, as (reg << 16 | value) -> WoLDiag-out
++ *   nicephy                     PCIe PHY (EPHY) 0x00-0x3F, as (reg << 16 | value) -> WoLDiag-out
++ *   ocpall | phyocp             MAC OCP 0xC000-0xEFFE | PHY OCP 0xA000-0xBFFE, 16-bit values -> WoLDiag-out
++ *   ocphi                       MAC OCP 0xF000-0xFFFE (MCU area), 16-bit values -> WoLDiag-out
++ *   rawboot | rawwake           the raw NIC state (kWoLDiagRawLen layout) taken at boot before the driver
++ *                               touched the chip | at the last wake before enable(), read-only -> WoLDiag-out
++ *   sio <ldn>                   Nuvoton Super I/O config, global + LDN -> WoLDiag-out
++ *   rsio <ldn<<8|cr>            one Super I/O register, read-clear ones too -> WoLDiag-outcmd
++ *   wmmio <addr> <val>          32-bit write, FCH AcpiMmio or PCIe ECAM only
++ *   wio8|wio16|wio32 <port> <val>  write, ACPI PM ports 0x800-0x8FF only
++ *   wpmcsr 0 <val>              NIC PCI PMCSR write (the first number is unused)
++ *   wsio <ldn<<8|cr> <val>      Super I/O write, only the bits in sioWriteMask()
++ *   wocp | wpocp <reg> <val>    NIC MAC OCP 0xC000-0xEFFE | PHY OCP 0xA000-0xBFFE write
++ *   wolarm 0 1                  arm WoL at the next restart too (as at power off)
++ *   wsleep 0 <0|1>              system sleep: 1 = NIC stays in D0 (PME_En as with WoL), as at power off; 0 = D3hot
++ *   wwomp 0 <0|1>               setWakeOnMagicPacket(), as macOS calls it before sleep (1) and after wake (0)
++ *   wtrace 0 0                  save the call trace (WoLDiag-trace) to NVRAM now, as at shutdown
++ *   s5run <cmd>;<cmd>...        run these at the next power off, after WoL is armed
++ */
++#define kWoLDiagMaxLen  (1024 * 1024)
++
++/* MAC OCP registers the r8168 code itself reads or writes (no firmware area), for nicocp. */
++static const UInt16 kWoLDiagOcpRegs[] = {
++    0xC094, 0xC09E, 0xC140, 0xC142, 0xD3C0, 0xD3C2, 0xD3C4, 0xD3E2, 0xD3E4, 0xD400, 0xD408, 0xD412,
++    0xD420, 0xD4DE, 0xDC00, 0xDC04, 0xDC20, 0xE02C, 0xE02E, 0xE052, 0xE054, 0xE056, 0xE094, 0xE098,
++    0xE0A2, 0xE0D6, 0xE428, 0xE434, 0xE43C, 0xE43E, 0xE63E, 0xE860, 0xE8DE, 0xEA80, 0xFC26, 0xFC28,
++    0xFC2A, 0xFC2C, 0xFC2E, 0xFC30, 0xFC32, 0xFC34, 0xFC36, 0xFC38
++};
++
++/* Super I/O CRs the sio dump leaves out (0xFF): 0xAA (as an index it leaves config mode) and the read-clear status registers. */
++static bool sioSkip(UInt8 ldn, UInt8 cr)
++{
++    if (cr == 0xAA)
++        return true;
++
++    if (ldn == 0x07)
++        return (cr == 0xE3) || (cr == 0xE7) || (cr == 0xF7);
++
++    if (ldn == 0x08)
++        return (cr == 0xE3) || (cr == 0xF3);
++
++    if (ldn == 0x09)
++        return (cr == 0xE3) || (cr == 0xE7) || (cr == 0xE8) || (cr == 0xF7);
++
++    if (ldn == 0x0A)
++        return (cr == 0xE3);
++
++    return false;
++}
++
++/*
++ * wsio: only the bits the board's S3/S5 SMI handlers (ASUS AsusApmSmi, AsusEupSmi, ProjectSMI) change,
++ * so the cold boot values can be put back. Key: LDN << 8 | CR (global CRs with LDN 0). 0 = not writable.
++ */
++static UInt8 sioWriteMask(UInt16 key)
++{
++    switch (key) {
++        case 0x002C: return 0x60;   /* pin 71: 3VSBSW# / GP33 / tri-state */
++        case 0x0730: return 0x02;   /* GPIO7 enable */
++        case 0x07E0: return 0x80;   /* GP77 direction */
++        case 0x07E1: return 0x80;   /* GP77 data */
++        case 0x07EC: return 0x80;
++        case 0x0AE4: return 0x10;   /* 3VSBSW# enable */
++        case 0x0AEE: return 0xFF;   /* RIA/RIB wake-up enable */
++        case 0x0AF4: return 0xFF;   /* PME status, write 1 to clear */
++        case 0x0FE6: return 0xFF;   /* GPIO7 push-pull / open drain */
++        case 0x11E1: return 0xFF;   /* GPIO/RI PSOUT wake-up status, write 1 to clear */
++        case 0x11E2: return 0xFF;   /* GPIO/RI PSOUT wake-up control */
++        case 0x12E2: return 0x08;   /* USB power in S5 */
++        case 0x12E4: return 0xFF;   /* MLED */
++        default:     return 0;
++    }
++}
++
++IOReturn RTL8111::setProperties(OSObject *properties)
++{
++    OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++    OSString *cmd = dict ? OSDynamicCast(OSString, dict->getObject("WoLDiag")) : NULL;
++
++    if (!cmd)
++        return super::setProperties(properties);
++
++    if (kauth_getuid() != 0)
++        return kIOReturnNotPrivileged;
++
++    return wolDiagCmd(cmd->getCStringNoCopy());
++}
++
++IOReturn RTL8111::wolDiagCmd(const char *cmd)
++{
++    char op[8] = { 0 };
++    char info[96];
++    char *end;
++    UInt64 addr, len, i;
++    UInt8 *buf;
++    OSData *data;
++    IOMemoryDescriptor *md = NULL;
++    IOMemoryMap *map = NULL;
++    IOReturn result = kIOReturnBadArgument;
++
++    if (!strncmp(cmd, "nic", 4))
++        return commandGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &RTL8111::wolDiagNicAction));
++
++    if (!strncmp(cmd, "s5run ", 6)) {
++        strlcpy(s5Cmds, cmd + 6, sizeof(s5Cmds));
++        setProperty("WoLDiag-s5run", s5Cmds);
++        return kIOReturnSuccess;
++    }
++
++    for (i = 0; i < sizeof(op) - 1 && cmd[i] && cmd[i] != ' '; i++)
++        op[i] = cmd[i];
++
++    op[i] = 0;
++    addr = strtouq(cmd + i, &end, 0);
++    len = strtouq(end, &end, 0);
++
++    /* Writes (len is the value): FCH AcpiMmio and PCIe ECAM, ACPI PM ports, NIC PMCSR. */
++    if (op[0] == 'w') {
++        UInt32 rb = 0;
++
++        if (!strcmp(op, "wmmio")) {
++            bool fch = (addr >= 0xFED80000ULL) && (addr < 0xFED82000ULL);
++            bool ecam = (addr >= 0xF0000000ULL) && (addr < 0xF8000000ULL);
++
++            if ((!fch && !ecam) || (addr & 3))
++                return kIOReturnBadArgument;
++
++            md = IOMemoryDescriptor::withAddressRange(addr & ~0xFFFULL, 0x1000, kIODirectionInOut | kIOMemoryMapperNone, NULL);
++
++            if (md)
++                map = md->map(kIOMapInhibitCache);
++
++            if (map) {
++                volatile UInt32 *reg = (volatile UInt32 *)(map->getVirtualAddress() + (addr & 0xFFFULL));
++
++                *reg = (UInt32)len;
++                rb = *reg;
++                result = kIOReturnSuccess;
++            } else {
++                result = kIOReturnVMError;
++            }
++            RELEASE(map);
++            RELEASE(md);
++        } else if (!strcmp(op, "wio8") || !strcmp(op, "wio16") || !strcmp(op, "wio32")) {
++            if ((addr < 0x800) || (addr > 0x8FF))
++                return kIOReturnBadArgument;
++
++            if (op[3] == '8') {
++                outb((UInt16)addr, (UInt8)len);
++                rb = inb((UInt16)addr);
++            } else if (op[3] == '1') {
++                outw((UInt16)addr, (UInt16)len);
++                rb = inw((UInt16)addr);
++            } else {
++                outl((UInt16)addr, (UInt32)len);
++                rb = inl((UInt16)addr);
++            }
++            result = kIOReturnSuccess;
++        } else if (!strcmp(op, "wpmcsr") && pciDevice && pciPMCtrlOffset) {
++            pciDevice->extendedConfigWrite16(pciPMCtrlOffset, (UInt16)len);
++            rb = pciDevice->extendedConfigRead16(pciPMCtrlOffset);
++            result = kIOReturnSuccess;
++        } else if (!strcmp(op, "wsio")) {
++            UInt8 mask = sioWriteMask((UInt16)addr);
++            UInt8 cr = (UInt8)addr;
++
++            if (!mask || (addr > 0xFFFF))
++                return kIOReturnBadArgument;
++
++            outb(0x2E, 0x87);
++            outb(0x2E, 0x87);
++
++            if (cr >= 0x30) {
++                outb(0x2E, 0x07);
++                outb(0x2F, (UInt8)(addr >> 8));
++            }
++            outb(0x2E, cr);
++            outb(0x2F, (UInt8)((inb(0x2F) & ~mask) | (len & mask)));
++            rb = inb(0x2F);
++            outb(0x2E, 0xAA);
++            result = kIOReturnSuccess;
++        } else if ((!strcmp(op, "wocp") && (addr >= 0xC000) && (addr <= 0xEFFE) && !(addr & 1)) ||
++                   (!strcmp(op, "wpocp") && (addr >= 0xA000) && (addr <= 0xBFFE) && !(addr & 1))) {
++            result = commandGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &RTL8111::wolDiagNicWriteAction),
++                                            (void *)(uintptr_t)(op[1] == 'p'), (void *)(uintptr_t)addr, (void *)(uintptr_t)len, &rb);
++        } else if (!strcmp(op, "wolarm")) {
++            wolArmRestart = (len != 0);
++            rb = wolArmRestart;
++            result = kIOReturnSuccess;
++        } else if (!strcmp(op, "wsleep")) {
++            sleepD0 = (len != 0);
++            rb = sleepD0;
++            result = kIOReturnSuccess;
++        } else if (!strcmp(op, "wwomp")) {
++            result = setWakeOnMagicPacket(len != 0);
++            rb = linuxData.wol_enabled;
++        } else if (!strcmp(op, "wtrace")) {
++            wolTraceSave();
++            result = kIOReturnSuccess;
++        }
++        if (result == kIOReturnSuccess) {
++            snprintf(info, sizeof(info), "%s 0x%llx 0x%llx readback 0x%x", op, addr, len, rb);
++            setProperty("WoLDiag-outcmd", info);
++            IOLog("Ethernet [RealtekRTL8111]: WoLDiag %s\n", info);
++        }
++        return result;
++    }
++
++    /* One Super I/O register, read-clear ones too (LDN A CR E3: PSIN/wake-up event status). */
++    if (!strcmp(op, "rsio")) {
++        UInt8 val;
++
++        if (addr > 0xFFFF)
++            return kIOReturnBadArgument;
++
++        outb(0x2E, 0x87);
++        outb(0x2E, 0x87);
++
++        if ((UInt8)addr >= 0x30) {
++            outb(0x2E, 0x07);
++            outb(0x2F, (UInt8)(addr >> 8));
++        }
++        outb(0x2E, (UInt8)addr);
++        val = inb(0x2F);
++        outb(0x2E, 0xAA);
++        snprintf(info, sizeof(info), "rsio 0x%llx = 0x%02x", addr, val);
++        setProperty("WoLDiag-outcmd", info);
++        return kIOReturnSuccess;
++    }
++
++    if (!strcmp(op, "sio") || !strcmp(op, "nicregs") || !strcmp(op, "eri"))
++        len = (op[0] == 's') ? 0x100 : 0x200;
++    else if (!strcmp(op, "nicocp"))
++        len = sizeof(kWoLDiagOcpRegs) / sizeof(kWoLDiagOcpRegs[0]) * 4;
++    else if (!strcmp(op, "nicphy"))
++        len = 0x40;
++    else if (!strcmp(op, "nicephy"))
++        len = 0x100;
++    else if (!strcmp(op, "ocpall"))
++        len = 0x3000;
++    else if (!strcmp(op, "phyocp") || !strcmp(op, "erihi"))
++        len = (op[0] == 'p') ? 0x2000 : 0x200;
++    else if (!strcmp(op, "ocphi"))
++        len = 0x1000;
++    else if (!strcmp(op, "rawboot") || !strcmp(op, "rawwake"))
++        len = kWoLDiagRawLen;
++
++    if (!len || len > kWoLDiagMaxLen)
++        return kIOReturnBadArgument;
++
++    buf = (UInt8 *)IOMallocZero(len);
++
++    if (!buf)
++        return kIOReturnNoMemory;
++
++    if (!strcmp(op, "phys") || !strcmp(op, "mmio") || !strcmp(op, "mmio8")) {
++        bool mmio = (op[0] == 'm');
++        bool bytes = (op[4] == '8');
++        UInt64 base = addr & ~0xFFFULL;
++        UInt64 off = addr - base;
++        UInt64 mapLen = (off + len + 0xFFF) & ~0xFFFULL;
++
++        if (mmio && !bytes && ((addr & 3) || (len & 3)))
++            goto done;
++
++        md = IOMemoryDescriptor::withAddressRange(base, mapLen, kIODirectionIn | kIOMemoryMapperNone, NULL);
++
++        if (md)
++            map = md->map(kIOMapReadOnly | (mmio ? kIOMapInhibitCache : kIOMapDefaultCache));
++
++        if (map) {
++            volatile UInt8 *va = (volatile UInt8 *)map->getVirtualAddress() + off;
++
++            if (mmio && !bytes) {
++                for (i = 0; i < len; i += 4)
++                    *(UInt32 *)(buf + i) = *(volatile UInt32 *)(va + i);
++            } else {
++                for (i = 0; i < len; i++)
++                    buf[i] = va[i];
++            }
++            result = kIOReturnSuccess;
++        } else {
++            result = kIOReturnVMError;
++        }
++        RELEASE(map);
++        RELEASE(md);
++    } else if (!strcmp(op, "io8") || !strcmp(op, "io16") || !strcmp(op, "io32")) {
++        UInt64 w = (op[2] == '8') ? 1 : ((op[2] == '1') ? 2 : 4);
++
++        if ((addr + len > 0x10000) || (len > 0x100) || (len % w) || (addr % w))
++            goto done;
++
++        for (i = 0; i < len; i += w) {
++            UInt16 port = (UInt16)(addr + i);
++
++            if (w == 1)
++                buf[i] = inb(port);
++            else if (w == 2)
++                *(UInt16 *)(buf + i) = inw(port);
++            else
++                *(UInt32 *)(buf + i) = inl(port);
++        }
++        result = kIOReturnSuccess;
++    } else if (!strcmp(op, "sio")) {
++        /* Nuvoton Super I/O at 0x2E (same keys as the DSDT): global CR 0x00-0x2F, then LDN <addr> CR 0x30-0xFF. */
++        if (addr > 0x1F)
++            goto done;
++
++        outb(0x2E, 0x87);
++        outb(0x2E, 0x87);
++
++        for (i = 0; i < 0x30; i++) {
++            outb(0x2E, (UInt8)i);
++            buf[i] = inb(0x2F);
++        }
++        outb(0x2E, 0x07);
++        outb(0x2F, (UInt8)addr);
++
++        for (i = 0x30; i < 0x100; i++) {
++            if (sioSkip((UInt8)addr, (UInt8)i)) {
++                buf[i] = 0xFF;
++                continue;
++            }
++            outb(0x2E, (UInt8)i);
++            buf[i] = inb(0x2F);
++        }
++        outb(0x2E, 0xAA);
++        result = kIOReturnSuccess;
++    } else if (!strcmp(op, "nicregs") || !strcmp(op, "eri") || !strcmp(op, "nicocp") || !strcmp(op, "nicphy") ||
++               !strcmp(op, "nicephy") || !strcmp(op, "ocpall") || !strcmp(op, "phyocp") || !strcmp(op, "erihi") ||
++               !strcmp(op, "ocphi")) {
++        uintptr_t mode = !strcmp(op, "eri") ? 1 : !strcmp(op, "nicocp") ? 2 : !strcmp(op, "nicphy") ? 3 :
++                         !strcmp(op, "nicephy") ? 4 : !strcmp(op, "ocpall") ? 5 : !strcmp(op, "phyocp") ? 6 :
++                         !strcmp(op, "erihi") ? 7 : !strcmp(op, "ocphi") ? 8 : 0;
++
++        result = commandGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &RTL8111::wolDiagNicDumpAction),
++                                        buf, (void *)mode);
++    } else if (!strcmp(op, "rawboot") || !strcmp(op, "rawwake")) {
++        UInt8 *raw = rawBuf[(op[3] == 'w') ? 1 : 0];
++
++        if (raw) {
++            memcpy(buf, raw, kWoLDiagRawLen);
++            result = kIOReturnSuccess;
++        } else {
++            result = kIOReturnNotFound;
++        }
++    }
++
++done:
++    if (result == kIOReturnSuccess) {
++        data = OSData::withBytes(buf, (unsigned int)len);
++
++        if (data) {
++            setProperty("WoLDiag-out", data);
++            data->release();
++        }
++        snprintf(info, sizeof(info), "%s 0x%llx 0x%llx", op, addr, len);
++        setProperty("WoLDiag-outcmd", info);
++    }
++    IOFree(buf, len);
++
++    return result;
++}
++
++/* PHY OCP read as in mdio_real_direct_read_phy_ocp(). */
++UInt16 RTL8111::wolDiagPhyOcpRead(UInt16 reg)
++{
++    UInt32 n;
++
++    WriteReg32(PHYOCP, ((UInt32)reg / 2) << OCPR_Addr_Reg_shift);
++
++    for (n = 0; n < 100; n++) {
++        IODelay(1);
++
++        if (ReadReg32(PHYOCP) & OCPR_Flag)
++            break;
++    }
++    return ReadReg32(PHYOCP) & OCPDR_Data_Mask;
++}
++
++/*
++ * Raw NIC state (which: 0 boot, 1 wake), read-only: at boot before the driver touches the chip and
++ * at wake before enable(), to see how the chip comes out of a reset. Layout as kWoLDiagRawLen.
++ */
++void RTL8111::wolDiagRaw(UInt32 which)
++{
++    UInt8 *buf;
++    UInt32 i;
++
++    if (!baseAddr || (which > 1))
++        return;
++
++    if (!rawBuf[which])
++        rawBuf[which] = (UInt8 *)IOMallocZero(kWoLDiagRawLen);
++
++    buf = rawBuf[which];
++
++    if (!buf)
++        return;
++
++    for (i = 0; i < 0x100; i += 4)
++        *(UInt32 *)(buf + i) = ReadReg32(i);
++
++    for (i = 0; i < 0x400; i += 4)
++        *(UInt32 *)(buf + 0x100 + i) = rtl8168_eri_read(baseAddr, i, 4, ERIAR_ExGMAC);
++
++    for (i = 0; i < 0x4000; i += 2)
++        *(UInt16 *)(buf + 0x500 + i) = rtl8168_mac_ocp_read(&linuxData, 0xC000 + i);
++
++    for (i = 0; i < 0x2000; i += 2)
++        *(UInt16 *)(buf + 0x4500 + i) = wolDiagPhyOcpRead(0xA000 + i);
++
++    IOLog("Ethernet [RealtekRTL8111]: WoLDiag raw %s: ERI_DC=0x%08x D408=0x%04x PHY state=%u\n",
++          which ? "wake" : "boot", *(UInt32 *)(buf + 0x100 + 0xDC), *(UInt16 *)(buf + 0x500 + 0x1408),
++          *(UInt16 *)(buf + 0x4500 + 0x420) & 7);
++}
++
++/*
++ * NIC register dumps for WoLDiag (mode in arg1): 0 MMIO 0x00-0xFF (rest zero), 1 ERI 0x000-0x1FF,
++ * 2 the MAC OCP registers in kWoLDiagOcpRegs, 3 PHY MII 0x00-0x0F, 4 EPHY 0x00-0x3F; 2-4 as (reg << 16 | value);
++ * 5 MAC OCP 0xC000-0xEFFE, 6 PHY OCP 0xA000-0xBFFE, as 16-bit values; 7 ERI 0x200-0x3FF;
++ * 8 MAC OCP 0xF000-0xFFFE, as 16-bit values.
++ */
++IOReturn RTL8111::wolDiagNicDumpAction(void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    UInt8 *buf = (UInt8 *)arg0;
++    uintptr_t mode = (uintptr_t)arg1;
++    bool eri = (mode == 1);
++    UInt32 i;
++
++    if (!baseAddr)
++        return kIOReturnNotReady;
++
++    if (mode == 2) {
++        for (i = 0; i < sizeof(kWoLDiagOcpRegs) / sizeof(kWoLDiagOcpRegs[0]); i++)
++            *(UInt32 *)(buf + i * 4) = ((UInt32)kWoLDiagOcpRegs[i] << 16) | rtl8168_mac_ocp_read(&linuxData, kWoLDiagOcpRegs[i]);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 3) {
++        for (i = 0; i < 0x10; i++)
++            *(UInt32 *)(buf + i * 4) = (i << 16) | (rtl8168_mdio_read(&linuxData, i) & 0xFFFF);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 4) {
++        for (i = 0; i < 0x40; i++)
++            *(UInt32 *)(buf + i * 4) = (i << 16) | rtl8168_ephy_read(baseAddr, i);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 5) {
++        for (i = 0; i < 0x3000; i += 2)
++            *(UInt16 *)(buf + i) = rtl8168_mac_ocp_read(&linuxData, 0xC000 + i);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 6) {
++        for (i = 0; i < 0x2000; i += 2)
++            *(UInt16 *)(buf + i) = wolDiagPhyOcpRead(0xA000 + i);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 7) {
++        for (i = 0; i < 0x200; i += 4)
++            *(UInt32 *)(buf + i) = rtl8168_eri_read(baseAddr, 0x200 + i, 4, ERIAR_ExGMAC);
++
++        return kIOReturnSuccess;
++    }
++    if (mode == 8) {
++        for (i = 0; i < 0x1000; i += 2)
++            *(UInt16 *)(buf + i) = rtl8168_mac_ocp_read(&linuxData, 0xF000 + i);
++
++        return kIOReturnSuccess;
++    }
++    for (i = 0; i < 0x200; i += 4) {
++        if (eri)
++            *(UInt32 *)(buf + i) = rtl8168_eri_read(baseAddr, i, 4, ERIAR_ExGMAC);
++        else if (i < 0x100)
++            *(UInt32 *)(buf + i) = ReadReg32(i);
++    }
++    return kIOReturnSuccess;
++}
++
++/* NIC OCP write for WoLDiag (arg0: 0 MAC OCP, 1 PHY OCP), with readback into arg3. */
++IOReturn RTL8111::wolDiagNicWriteAction(void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    bool phy = ((uintptr_t)arg0 != 0);
++    UInt16 reg = (UInt16)(uintptr_t)arg1;
++    UInt16 val = (UInt16)(uintptr_t)arg2;
++    UInt32 *rb = (UInt32 *)arg3;
++    UInt32 n;
++
++    if (!baseAddr)
++        return kIOReturnNotReady;
++
++    if (!phy) {
++        rtl8168_mac_ocp_write(&linuxData, reg, val);
++        *rb = rtl8168_mac_ocp_read(&linuxData, reg);
++        return kIOReturnSuccess;
++    }
++    /* As mdio_real_direct_write_phy_ocp() and mdio_real_direct_read_phy_ocp(). */
++    WriteReg32(PHYOCP, OCPR_Write | ((UInt32)(reg / 2) << OCPR_Addr_Reg_shift) | val);
++
++    for (n = 0; n < 100; n++) {
++        IODelay(1);
++
++        if (!(ReadReg32(PHYOCP) & OCPR_Flag))
++            break;
++    }
++    WriteReg32(PHYOCP, (UInt32)(reg / 2) << OCPR_Addr_Reg_shift);
++
++    for (n = 0; n < 100; n++) {
++        IODelay(1);
++
++        if (ReadReg32(PHYOCP) & OCPR_Flag)
++            break;
++    }
++    *rb = ReadReg32(PHYOCP) & OCPDR_Data_Mask;
++
++    return kIOReturnSuccess;
++}
++
++IOReturn RTL8111::wolDiagNicAction(void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    char buf[400];
++    UInt16 pm = (pciDevice && pciPMCtrlOffset) ? pciDevice->extendedConfigRead16(pciPMCtrlOffset) : 0;
++
++    if (!baseAddr)
++        return kIOReturnNotReady;
++
++    snprintf(buf, sizeof(buf), "Config0-5=%02x %02x %02x %02x %02x %02x PMCH=0x%02x D0=0x%02x F1=0x%02x F2=0x%02x "
++             "ChipCmd=0x%02x RxConfig=0x%08x PHYstatus=0x%02x ERI_DC=0x%08x PMCSR=0x%04x wolActive=%d wol_enabled=%d wol_opts=0x%x",
++             ReadReg8(Config0), ReadReg8(Config1), ReadReg8(Config2), ReadReg8(Config3), ReadReg8(Config4), ReadReg8(Config5),
++             ReadReg8(PMCH), ReadReg8(0xD0), ReadReg8(0xF1), ReadReg8(0xF2),
++             ReadReg8(ChipCmd), ReadReg32(RxConfig), ReadReg8(PHYstatus),
++             rtl8168_eri_read(baseAddr, 0xDC, 4, ERIAR_ExGMAC), pm,
++             wolActive, linuxData.wol_enabled, linuxData.wol_opts);
++    setProperty("WoLDiag-nic", buf);
++
++    return kIOReturnSuccess;
++}
+diff --git a/RealtekRTL8111/RealtekRTL8111.hpp b/RealtekRTL8111/RealtekRTL8111.hpp
+index 3f0d1da..06c8193 100644
+--- a/RealtekRTL8111/RealtekRTL8111.hpp
++++ b/RealtekRTL8111/RealtekRTL8111.hpp
+@@ -213,6 +213,9 @@ enum
+ 
+ #define kChipsetName "Chipset"
+ 
++/* Local WoL diagnostics: raw NIC state, MMIO 0x00-0xFF, ERI 0x000-0x3FF, MAC OCP 0xC000-0xFFFE, PHY OCP 0xA000-0xBFFE. */
++#define kWoLDiagRawLen  (0x100 + 0x400 + 0x4000 + 0x2000)
++
+ /*
+  * Indicates if a tx IOMemoryDescriptor is in the prepared
+  * (active) or completed state (inactive).
+@@ -289,6 +292,23 @@ public:
+ 	virtual IOReturn registerWithPolicyMaker(IOService *policyMaker) override;
+     virtual IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *policyMaker ) override;
+ 	virtual void systemWillShutdown(IOOptionBits specifier) override;
++    void wolDiag(const char *when);
++    virtual IOReturn setProperties(OSObject *properties) override;
++    IOReturn wolDiagCmd(const char *cmd);
++    IOReturn wolDiagNicAction(void *arg0, void *arg1, void *arg2, void *arg3);
++    IOReturn wolDiagNicDumpAction(void *arg0, void *arg1, void *arg2, void *arg3);
++    IOReturn wolDiagNicWriteAction(void *arg0, void *arg1, void *arg2, void *arg3);
++    UInt16 wolDiagPhyOcpRead(UInt16 reg);
++    void wolDiagRaw(UInt32 which);
++    void wolTrace(const char *ev);
++    void wolTraceSave();
++    char s5Cmds[400];
++    char wolTraceBuf[480];
++    bool wolArmRestart;
++    bool sleepD0;
++    bool shuttingDown;
++    UInt8 *rawBuf[2];
++    UInt32 wompCalls;
+ 
+ 	/* IONetworkController methods. */	
+ 	virtual IOReturn enable(IONetworkInterface *netif) override;
+diff --git a/RealtekRTL8111/RealtekRTL8111Hardware.cpp b/RealtekRTL8111/RealtekRTL8111Hardware.cpp
+index 9fa86dc..c6f2b94 100644
+--- a/RealtekRTL8111/RealtekRTL8111Hardware.cpp
++++ b/RealtekRTL8111/RealtekRTL8111Hardware.cpp
+@@ -93,8 +93,18 @@ IOReturn RTL8111::setPowerStateWakeAction(OSObject *owner, void *arg1, void *arg
+         
+         val16 &= ~(kPCIPMCSPowerStateMask | kPCIPMCSPMEStatus | kPCIPMCSPMEEnable);
+         val16 |= kPCIPMCSPowerStateD0;
++
++        /*
++         * Local patch: PME_Status is write-1-to-clear. Writing 0
++         * left it set after a WoL wake (PMCSR 0x8008 instead of 0x0008 at boot), and
++         * with a stale PME_Status the NIC never woke the machine from S5 again.
++         */
++        val16 |= kPCIPMCSPMEStatus;
+         
+         dev->extendedConfigWrite16(offset, val16);
++
++        /* Local diagnostics: how the chip came out of sleep, before enable() sets it up again. */
++        ethCtlr->wolDiagRaw(1);
+     }
+     return kIOReturnSuccess;
+ }
+@@ -114,10 +124,14 @@ IOReturn RTL8111::setPowerStateSleepAction(OSObject *owner, void *arg1, void *ar
+         
+         val16 &= ~(kPCIPMCSPowerStateMask | kPCIPMCSPMEStatus | kPCIPMCSPMEEnable);
+ 
++        /*
++         * Local diagnostics ("wsleep 0 1"): stay in D0 as at power off, where the
++         * BIOS sets PME_En on the NIC and leaves it in D0, instead of D3hot.
++         */
+         if (ethCtlr->wolActive)
+-            val16 |= (kPCIPMCSPMEStatus | kPCIPMCSPMEEnable | kPCIPMCSPowerStateD3);
++            val16 |= (kPCIPMCSPMEStatus | kPCIPMCSPMEEnable | (ethCtlr->sleepD0 ? kPCIPMCSPowerStateD0 : kPCIPMCSPowerStateD3));
+         else
+-            val16 |= kPCIPMCSPowerStateD3;
++            val16 |= (ethCtlr->sleepD0 ? kPCIPMCSPowerStateD0 : kPCIPMCSPowerStateD3);
+         
+         dev->extendedConfigWrite16(offset, val16);
+     }
+@@ -155,6 +169,9 @@ bool RTL8111::initRTL8111()
+         DebugLog("Unsupported chip found. Aborting...\n");
+         goto done;
+     }
++    /* Local diagnostics: the chip as the reset (and the BIOS) left it, before the driver changes anything. */
++    wolDiagRaw(0);
++
+     tp->chipset =  tp->mcfg;
+     
+     chipsetNumber = OSNumber::withNumber(tp->chipset, 32);
+@@ -568,7 +585,14 @@ bool RTL8111::initRTL8111()
+     rxConfigMask = rtl_chip_info[tp->chipset].RxConfigMask;
+     
+     rtl8168_get_hw_wol(tp);
+-    
++    {
++        char ev[16];
++
++        /* Local diagnostics: WoL state as the reset left it, and the raw PMCH. */
++        snprintf(ev, sizeof(ev), "B%d/%02x", tp->wol_enabled, rawBuf[0] ? rawBuf[0][PMCH] : 0);
++        wolTrace(ev);
++    }
++
+     options1 = ReadReg8(Config3);
+     options2 = ReadReg8(Config5);
+     csi_tmp = rtl8168_eri_read(baseAddr, 0xDE, 4, ERIAR_ExGMAC);
+@@ -590,7 +614,13 @@ bool RTL8111::initRTL8111()
+         case CFG_METHOD_30:
+         case CFG_METHOD_31:
+         case CFG_METHOD_32:
+-            wol = ((options1 & LinkUp) || (csi_tmp & BIT_0) || (options2 & UWF) || (options2 & BWF) || (options2 & MWF)) ? true : false;
++            /*
++             * Local patch: the magic packet enable bit (ERI 0xDE
++             * bit 0) depends on how the machine was started: set after a cold boot, but
++             * clear after a warm restart, which disabled WoL for the whole session.
++             * These chips support magic packet wakeup, so don't derive it from that bit.
++             */
++            wol = true;
+             break;
+             
+         case CFG_METHOD_DEFAULT:
+@@ -603,6 +633,9 @@ bool RTL8111::initRTL8111()
+     }
+     /* Set wake on LAN support. */
+     wolCapable = wolCapable && wol;
++
++    if (wolCapable)
++        tp->wol_opts |= WAKE_MAGIC;
+     
+ #ifdef DEBUG
+     
