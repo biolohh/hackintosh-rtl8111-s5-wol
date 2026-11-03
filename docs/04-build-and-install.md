@@ -95,4 +95,4 @@ If macOS does not boot at all, the EFI partition can also be edited from Windows
 
 The patch replaces the kext with a modified build. A new upstream release would overwrite it: re-apply the patch to
 the new source (`git apply --3way` helps if the context moved) or check whether upstream fixed it
-([upstream issue](https://github.com/Mieze/RTL8111_driver_for_OS_X/issues)).
+([upstream issue #98](https://github.com/Mieze/RTL8111_driver_for_OS_X/issues/98)).

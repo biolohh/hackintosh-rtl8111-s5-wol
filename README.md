@@ -7,7 +7,7 @@ with a small driver patch (+75/−3 lines), a prebuilt kext, test results, and o
 Windows dual boot and Home Assistant.
 
 **Status:** fixed and tested on one machine (ASUS PRIME B550M-K, RTL8111H, macOS 26.2, OpenCore 1.0.8). Reports from
-other boards are welcome. Upstream report: [Mieze/RTL8111_driver_for_OS_X issues](https://github.com/Mieze/RTL8111_driver_for_OS_X/issues).
+other boards are welcome. Upstream report: [Mieze/RTL8111_driver_for_OS_X#98](https://github.com/Mieze/RTL8111_driver_for_OS_X/issues/98).
 
 ## Fix it with your AI agent (copy and paste)
 
