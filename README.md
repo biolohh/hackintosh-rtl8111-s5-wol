@@ -80,6 +80,27 @@ without WoL, power the PLL and the PHY up again and power them down in WoL mode.
 always WoL capable on these chips, `PME_Status` is cleared correctly (write 1), and a stale `PME_Status` is cleared
 before S5. Details: [docs/03-the-patch.md](docs/03-the-patch.md).
 
+## FAQ
+
+**Hackintosh Wake-on-LAN not working after sleep?**
+Yes, this is the bug fixed here: with RealtekRTL8111.kext, WoL from shutdown works only until macOS sleeps once.
+See [docs/01-symptoms.md](docs/01-symptoms.md) to check that it matches.
+
+**Why does WoL from shutdown (S5) fail on macOS but sleep (S3) WoL works?**
+macOS turns WoL off in the driver after every wake, and the kernel takes the interface down before the driver's
+shutdown hook runs. Explained in [docs/02-root-cause.md](docs/02-root-cause.md).
+
+**Do restarts fix it?** No. Only a manual power-on does, until the next sleep.
+
+**LAN LEDs are dark after shutdown on a Hackintosh with a Realtek NIC. Why?**
+The PHY was powered down without WoL, so there is no link and no magic packet can arrive.
+
+**Does it work on RTL8111 / RTL8168 / RTL8111H, OpenCore, macOS Sonoma / Sequoia / Tahoe?**
+Tested on RTL8111H, OpenCore 1.0.8, macOS 26.2 (Tahoe). Other chips and macOS versions are very likely affected the same way.
+
+**Can an AI agent apply the fix?** Yes, there is a copy-paste prompt for Claude Code, Codex, Cursor and similar
+agents [above](#fix-it-with-your-ai-agent-copy-and-paste).
+
 ## Install (manual)
 
 - **Prebuilt:** download the zip from [Releases](../../releases), check the SHA-256, put `RealtekRTL8111.kext` into
